@@ -7,11 +7,15 @@ import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.graphics.Typeface;
+import android.net.ConnectivityManager;
+import android.net.LinkProperties;
+import android.net.Network;
 import android.net.VpnService;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.Settings;
 import android.text.InputType;
 import android.view.Gravity;
 import android.view.View;
@@ -25,6 +29,7 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import java.net.InetAddress;
 import java.text.DateFormat;
 import java.util.Date;
 import java.util.List;
@@ -38,10 +43,15 @@ public class MainActivity extends Activity {
     private static final int DIM = Color.rgb(140, 150, 160);
     private static final int GREEN = Color.rgb(46, 204, 113);
     private static final int RED = Color.rgb(231, 96, 80);
+    private static final String TEST_DOMAIN = "doubleclick.net";
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private TextView status;
     private TextView stats;
+    private TextView diag;
+    private volatile String testResult = "";
+    private volatile boolean testPassed;
+    private int ticks;
     private TextView listInfo;
     private Button toggle;
     private Button update;
@@ -83,6 +93,9 @@ public class MainActivity extends Activity {
             }
         });
         root.addView(toggle, block(dp(64), dp(16)));
+
+        diag = text("", 15, DIM, false);
+        root.addView(diag, block(ViewGroup.LayoutParams.WRAP_CONTENT, dp(12)));
 
         stats = text("", 16, TEXT, false);
         root.addView(stats, block(ViewGroup.LayoutParams.WRAP_CONTENT, dp(16)));
@@ -162,6 +175,7 @@ public class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
         shownVersion = -1;
+        ticks = 0;
         handler.post(tick);
     }
 
@@ -221,6 +235,22 @@ public class MainActivity extends Activity {
         stats.setText("Blocked " + Stats.blocked.get() + " of " + Stats.total.get()
                 + " lookups since the app started");
 
+        // Re-run the self-test shortly after opening and then every ten seconds.
+        if (on && ticks % 10 == 2) runSelfTest();
+        ticks++;
+        String pdns = privateDnsHost();
+        if (!on) {
+            testResult = "";
+            diag.setText("");
+        } else if (pdns != null) {
+            diag.setTextColor(RED);
+            diag.setText("Not blocking: Android's Private DNS is set to \"" + pdns + "\", which bypasses "
+                    + "this app. Open Settings, search for \"Private DNS\", and set it to Off.");
+        } else {
+            diag.setTextColor(testResult.isEmpty() ? DIM : testPassed ? GREEN : RED);
+            diag.setText(testResult.isEmpty() ? "Checking that blocking works…" : testResult);
+        }
+
         long at = Prefs.get(this).getLong("listUpdated", 0);
         if (updating) {
             listInfo.setText("Downloading…");
@@ -239,6 +269,53 @@ public class MainActivity extends Activity {
             shownVersion = Stats.version;
             renderLog();
         }
+    }
+
+    /** Returns the Private DNS provider hostname if one is forced on, otherwise null. */
+    private String privateDnsHost() {
+        try {
+            String mode = Settings.Global.getString(getContentResolver(), "private_dns_mode");
+            if ("hostname".equals(mode)) {
+                String host = Settings.Global.getString(getContentResolver(), "private_dns_specifier");
+                return host == null || host.isEmpty() ? "a custom provider" : host;
+            }
+        } catch (RuntimeException ignored) {
+        }
+        if (Build.VERSION.SDK_INT >= 28) {
+            try {
+                ConnectivityManager cm = (ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
+                for (Network n : cm.getAllNetworks()) {
+                    LinkProperties lp = cm.getLinkProperties(n);
+                    if (lp != null && lp.getPrivateDnsServerName() != null) return lp.getPrivateDnsServerName();
+                }
+            } catch (RuntimeException ignored) {
+            }
+        }
+        return null;
+    }
+
+    /** Looks up a known ad domain the way any app would and reports whether it came back blocked. */
+    private void runSelfTest() {
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                String msg;
+                boolean pass = false;
+                try {
+                    InetAddress[] all = InetAddress.getAllByName(TEST_DOMAIN);
+                    pass = all.length > 0;
+                    for (InetAddress a : all) pass &= a.isAnyLocalAddress();
+                    msg = pass ? "Self-test passed: " + TEST_DOMAIN + " is blocked on this phone."
+                            : "Self-test FAILED: " + TEST_DOMAIN + " still resolves to "
+                            + all[0].getHostAddress() + ", so lookups are not going through this app.";
+                } catch (Exception e) {
+                    msg = "Self-test could not run: no answer for " + TEST_DOMAIN
+                            + ". Check the internet connection.";
+                }
+                testPassed = pass;
+                testResult = msg;
+            }
+        }, "adblock-selftest").start();
     }
 
     private void renderLog() {
